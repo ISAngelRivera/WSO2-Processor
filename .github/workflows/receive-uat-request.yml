@@ -1,8 +1,8 @@
 # =============================================================================
-# WSO2-Processor: Receive UAT Registration Request
+# WSO2-Processor: Extractor de APIs de WSO2
 # =============================================================================
-# El subdominio se lee de additionalProperties de la API (campo: subdominio)
-# Valida que el subdominio esté especificado y que exista en repo-config.yaml
+# Vendor-específico: Solo extrae datos de WSO2 y los pasa a Helix-Processor
+# NO contiene lógica de negocio, Helix, ni almacenamiento
 # =============================================================================
 name: Receive UAT Request
 
@@ -35,50 +35,29 @@ on:
         description: 'Request timestamp'
         required: false
         type: string
-      metadata:
-        description: 'Additional metadata as JSON'
-        required: false
-        type: string
-        default: '{}'
 
 env:
   WSO2_BASE_URL: https://wso2-apim:9443
   WSO2_USERNAME: admin
   WSO2_PASSWORD: admin
-  TARGET_REPO: ISAngelRivera/GIT-Helix-Processor
-  TARGET_BRANCH: main
+  HELIX_PROCESSOR_REPO: ISAngelRivera/GIT-Helix-Processor
 
 jobs:
-  process-uat-request:
-    name: Process UAT Registration Request
+  extract-and-forward:
+    name: Extract API from WSO2
     runs-on: [self-hosted, linux, apiops]
 
     steps:
-      - name: Checkout WSO2-Processor
-        uses: actions/checkout@v4
-
-      - name: Log Request Details
+      - name: Log Request
         run: |
           echo "=========================================="
-          echo "  UAT Registration Request Received"
+          echo "  WSO2 API Extraction Request"
           echo "=========================================="
           echo "API ID:      ${{ inputs.apiId }}"
           echo "API Name:    ${{ inputs.apiName }}"
           echo "API Version: ${{ inputs.apiVersion }}"
-          echo "API Context: ${{ inputs.apiContext }}"
           echo "User:        ${{ inputs.userId }}"
-          echo "Run ID:      ${{ github.run_id }}"
           echo "=========================================="
-
-      - name: Generate Request ID
-        id: request-id
-        run: |
-          DATE=$(date +%Y-%m-%d)
-          API_NAME_SLUG=$(echo "${{ inputs.apiName }}" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd '[:alnum:]-')
-          VERSION_SLUG=$(echo "${{ inputs.apiVersion }}" | tr '.' '-')
-          REQUEST_ID="${DATE}-${API_NAME_SLUG}-v${VERSION_SLUG}-uat"
-          echo "request_id=${REQUEST_ID}" >> $GITHUB_OUTPUT
-          echo "Generated Request ID: ${REQUEST_ID}"
 
       - name: Get WSO2 OAuth Token
         id: wso2-token
@@ -88,7 +67,7 @@ jobs:
           CLIENT_RESPONSE=$(curl -sk -X POST \
             -H "Authorization: Basic $(echo -n 'admin:admin' | base64)" \
             -H "Content-Type: application/json" \
-            -d '{"callbackUrl":"https://localhost","clientName":"github_actions_${{ github.run_id }}","owner":"admin","grantType":"client_credentials password refresh_token","saasApp":true}' \
+            -d '{"callbackUrl":"https://localhost","clientName":"wso2_processor_${{ github.run_id }}","owner":"admin","grantType":"client_credentials password refresh_token","saasApp":true}' \
             "${{ env.WSO2_BASE_URL }}/client-registration/v0.17/register" 2>/dev/null || echo '{}')
 
           CLIENT_ID=$(echo "$CLIENT_RESPONSE" | jq -r '.clientId // empty')
@@ -96,225 +75,112 @@ jobs:
 
           if [ -z "$CLIENT_ID" ]; then
             echo "ERROR: WSO2 not reachable"
-            echo "mock=true" >> $GITHUB_OUTPUT
-            exit 0
+            exit 1
           fi
 
           TOKEN_RESPONSE=$(curl -sk -X POST \
             -H "Authorization: Basic $(echo -n "$CLIENT_ID:$CLIENT_SECRET" | base64)" \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "grant_type=password&username=admin&password=admin&scope=apim:api_view apim:api_publish" \
+            -d "grant_type=password&username=admin&password=admin&scope=apim:api_view" \
             "${{ env.WSO2_BASE_URL }}/oauth2/token" 2>/dev/null || echo '{}')
 
           ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
 
           if [ -z "$ACCESS_TOKEN" ]; then
             echo "ERROR: Could not get access token"
-            echo "mock=true" >> $GITHUB_OUTPUT
-          else
-            echo "Access token obtained"
-            echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
-            echo "mock=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Export API from WSO2
-        id: export-api
-        run: |
-          mkdir -p ./export
-
-          if [ "${{ steps.wso2-token.outputs.mock }}" == "true" ]; then
-            echo "ERROR: Cannot export API - WSO2 not reachable"
             exit 1
           fi
 
-          echo "Exporting API from WSO2..."
-          curl -sk -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
-            "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}" > ./export/api.json
+          echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+          echo "Token obtained"
 
-          curl -sk -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
-            "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}/swagger" > ./export/swagger.json
+      - name: Export API from WSO2
+        id: export
+        run: |
+          echo "Exporting API from WSO2..."
+
+          # Exportar api.json
+          API_JSON=$(curl -sk -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
+            "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}")
+
+          # Exportar swagger.json
+          SWAGGER_JSON=$(curl -sk -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
+            "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}/swagger")
 
           # Extraer subdominio de additionalProperties
-          SUBDOMINIO=$(cat ./export/api.json | jq -r '.additionalProperties[] | select(.name=="subdominio") | .value // empty')
+          SUBDOMINIO=$(echo "$API_JSON" | jq -r '.additionalProperties[]? | select(.name=="subdominio") | .value // empty')
 
-          # Si no está en el array, buscar en additionalPropertiesMap
+          # Si no está, buscar en additionalPropertiesMap
           if [ -z "$SUBDOMINIO" ]; then
-            SUBDOMINIO=$(cat ./export/api.json | jq -r '.additionalPropertiesMap.subdominio // empty')
+            SUBDOMINIO=$(echo "$API_JSON" | jq -r '.additionalPropertiesMap.subdominio // empty')
           fi
 
-          BACKEND_URL=$(cat ./export/api.json | jq -r '.endpointConfig.production_endpoints.url // "unknown"')
+          # Extraer backend URL
+          BACKEND_URL=$(echo "$API_JSON" | jq -r '.endpointConfig.production_endpoints.url // "unknown"')
 
-          echo "Backend URL: $BACKEND_URL"
-          echo "Subdominio from properties: $SUBDOMINIO"
+          echo "Subdominio: $SUBDOMINIO"
+          echo "Backend: $BACKEND_URL"
 
-          echo "subdominio=$SUBDOMINIO" >> $GITHUB_OUTPUT
-          echo "backend_url=$BACKEND_URL" >> $GITHUB_OUTPUT
-
-          echo "Export files:"
-          ls -la ./export/
-
-      - name: Validate subdominio field
-        id: validate-subdominio
-        run: |
-          SUBDOMINIO="${{ steps.export-api.outputs.subdominio }}"
-
+          # Validar que subdominio está especificado
           if [ -z "$SUBDOMINIO" ]; then
             echo "=========================================="
             echo "  ERROR: Campo 'subdominio' no especificado"
             echo "=========================================="
             echo ""
-            echo "La API debe tener una propiedad adicional llamada 'subdominio'"
-            echo "con el valor del subdominio al que pertenece."
-            echo ""
+            echo "La API debe tener una propiedad adicional 'subdominio'"
             echo "Para configurarlo:"
             echo "1. Ve a la API en el Publisher"
             echo "2. Properties > Additional Properties"
             echo "3. Añade: subdominio = <nombre-subdominio>"
             echo ""
-            echo "Subdominios disponibles: finanzas-pagos, rrhh-empleados"
-            echo "=========================================="
             exit 1
           fi
 
-          echo "Subdominio especificado: $SUBDOMINIO"
+          # Codificar en base64 para pasar al siguiente workflow
+          API_JSON_B64=$(echo "$API_JSON" | base64 -w 0)
+          SWAGGER_JSON_B64=$(echo "$SWAGGER_JSON" | base64 -w 0)
 
-      - name: Fetch repo-config and validate subdominio exists
-        id: validate-repo
+          echo "subdominio=$SUBDOMINIO" >> $GITHUB_OUTPUT
+          echo "backend_url=$BACKEND_URL" >> $GITHUB_OUTPUT
+          echo "api_json_b64=$API_JSON_B64" >> $GITHUB_OUTPUT
+          echo "swagger_json_b64=$SWAGGER_JSON_B64" >> $GITHUB_OUTPUT
+
+          echo "API exported successfully"
+
+      - name: Forward to Helix-Processor
         env:
           GH_TOKEN: ${{ secrets.GIT_HELIX_PAT }}
         run: |
-          SUBDOMINIO="${{ steps.export-api.outputs.subdominio }}"
-          echo "Validating subdominio: $SUBDOMINIO"
+          echo "Forwarding to Helix-Processor..."
 
-          # Descargar repo-config.yaml
-          REPO_CONFIG=$(curl -sk -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3.raw" \
-            "https://api.github.com/repos/${{ env.TARGET_REPO }}/contents/repo-config.yaml" 2>/dev/null || echo "")
-
-          if [ -z "$REPO_CONFIG" ] || echo "$REPO_CONFIG" | grep -q "Not Found"; then
-            echo "ERROR: No se pudo descargar repo-config.yaml de ${{ env.TARGET_REPO }}"
-            exit 1
-          fi
-
-          echo "$REPO_CONFIG" > /tmp/repo-config.yaml
-          echo "repo-config.yaml descargado"
-
-          # Verificar que el subdominio existe en la configuración
-          # Buscar línea que sea exactamente "  subdominio:" (con 2 espacios de indentación)
-          if ! grep -q "^  ${SUBDOMINIO}:" /tmp/repo-config.yaml; then
-            echo "=========================================="
-            echo "  ERROR: Subdominio '$SUBDOMINIO' no existe"
-            echo "=========================================="
-            echo ""
-            echo "El subdominio especificado no está configurado en repo-config.yaml"
-            echo ""
-            echo "Subdominios disponibles:"
-            grep -E "^  [a-z].*:$" /tmp/repo-config.yaml | sed 's/://g' | sed 's/^ */  - /'
-            echo ""
-            echo "Contacta al equipo de plataforma para añadir el subdominio."
-            echo "=========================================="
-            exit 1
-          fi
-
-          echo "Subdominio '$SUBDOMINIO' validado correctamente"
-
-          # Verificar que existe la carpeta del subdominio en el repo
-          FOLDER_CHECK=$(curl -sk -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/${{ env.TARGET_REPO }}/contents/subdominios/${SUBDOMINIO}" 2>/dev/null || echo '{"message":"Not Found"}')
-
-          if echo "$FOLDER_CHECK" | grep -q "Not Found"; then
-            echo "WARNING: Carpeta subdominios/$SUBDOMINIO no existe, se creará con el PR"
-          else
-            echo "Carpeta subdominios/$SUBDOMINIO existe"
-          fi
-
-      - name: Prepare Request Files
-        run: |
-          REQUEST_ID="${{ steps.request-id.outputs.request_id }}"
-          SUBDOMINIO="${{ steps.export-api.outputs.subdominio }}"
-          REQUEST_DIR="./request-${REQUEST_ID}"
-          mkdir -p "$REQUEST_DIR"
-
-          echo "action: register-uat" > "$REQUEST_DIR/request.yaml"
-          echo "request_id: ${REQUEST_ID}" >> "$REQUEST_DIR/request.yaml"
-          echo "timestamp: ${{ inputs.timestamp }}" >> "$REQUEST_DIR/request.yaml"
-          echo "subdominio: ${SUBDOMINIO}" >> "$REQUEST_DIR/request.yaml"
-          echo "backend_url: ${{ steps.export-api.outputs.backend_url }}" >> "$REQUEST_DIR/request.yaml"
-          echo "api:" >> "$REQUEST_DIR/request.yaml"
-          echo "  id: ${{ inputs.apiId }}" >> "$REQUEST_DIR/request.yaml"
-          echo "  name: ${{ inputs.apiName }}" >> "$REQUEST_DIR/request.yaml"
-          echo "  version: ${{ inputs.apiVersion }}" >> "$REQUEST_DIR/request.yaml"
-          echo "  context: ${{ inputs.apiContext }}" >> "$REQUEST_DIR/request.yaml"
-          echo "user: ${{ inputs.userId }}" >> "$REQUEST_DIR/request.yaml"
-          echo "run_url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$REQUEST_DIR/request.yaml"
-
-          cp ./export/api.json "$REQUEST_DIR/"
-          cp ./export/swagger.json "$REQUEST_DIR/"
-
-          echo "Request files prepared:"
-          ls -la "$REQUEST_DIR/"
-          echo ""
-          cat "$REQUEST_DIR/request.yaml"
-
-      - name: Create PR in GIT-Helix-Processor
-        env:
-          GH_TOKEN: ${{ secrets.GIT_HELIX_PAT }}
-        run: |
-          REQUEST_ID="${{ steps.request-id.outputs.request_id }}"
-          REQUEST_DIR="./request-${REQUEST_ID}"
-          SUBDOMINIO="${{ steps.export-api.outputs.subdominio }}"
-          BRANCH_NAME="request/${REQUEST_ID}"
-          TARGET_FOLDER="subdominios/${SUBDOMINIO}/requests/${REQUEST_ID}"
-
-          echo "Creating PR in ${{ env.TARGET_REPO }}"
-          echo "Subdominio: $SUBDOMINIO"
-          echo "Target folder: $TARGET_FOLDER"
-
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ env.TARGET_REPO }}.git" target-repo
-          cd target-repo
-          git config user.name "WSO2-Processor Bot"
-          git config user.email "wso2-processor@github.actions"
-
-          # Check if branch already exists remotely
-          if git ls-remote --heads origin "${BRANCH_NAME}" | grep -q "${BRANCH_NAME}"; then
-            echo "Branch ${BRANCH_NAME} already exists, deleting it first..."
-            git push origin --delete "${BRANCH_NAME}" || true
-          fi
-
-          git checkout -b "${BRANCH_NAME}"
-          mkdir -p "${TARGET_FOLDER}"
-          cp -r "../${REQUEST_DIR}"/* "${TARGET_FOLDER}/"
-          git add .
-          git commit -m "feat(${SUBDOMINIO}): UAT request for ${{ inputs.apiName }} v${{ inputs.apiVersion }}"
-          git push origin "${BRANCH_NAME}"
-
-          # Check if PR already exists
-          EXISTING_PR=$(gh pr list --repo "${{ env.TARGET_REPO }}" --head "${BRANCH_NAME}" --json number --jq '.[0].number' 2>/dev/null || echo "")
-
-          if [ -n "$EXISTING_PR" ]; then
-            echo "PR #${EXISTING_PR} already exists for this branch"
-            PR_URL="https://github.com/${{ env.TARGET_REPO }}/pull/${EXISTING_PR}"
-          else
-            PR_URL=$(gh pr create \
-              --repo "${{ env.TARGET_REPO }}" \
-              --base "${{ env.TARGET_BRANCH }}" \
-              --head "${BRANCH_NAME}" \
-              --title "UAT [${SUBDOMINIO}]: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" \
-              --body "UAT Registration - API: ${{ inputs.apiName }} v${{ inputs.apiVersion }} - Subdominio: ${SUBDOMINIO} - Request ID: ${REQUEST_ID} - User: ${{ inputs.userId }} - Files: ${TARGET_FOLDER}/")
-          fi
+          # Llamar al workflow de Helix-Processor
+          gh workflow run process-api-request.yml \
+            --repo "${{ env.HELIX_PROCESSOR_REPO }}" \
+            -f subdominio="${{ steps.export.outputs.subdominio }}" \
+            -f apiName="${{ inputs.apiName }}" \
+            -f apiVersion="${{ inputs.apiVersion }}" \
+            -f apiContext="${{ inputs.apiContext }}" \
+            -f backendUrl="${{ steps.export.outputs.backend_url }}" \
+            -f apiJson="${{ steps.export.outputs.api_json_b64 }}" \
+            -f swaggerJson="${{ steps.export.outputs.swagger_json_b64 }}" \
+            -f sourceSystem="wso2" \
+            -f userId="${{ inputs.userId }}" \
+            -f sourceRunUrl="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           echo ""
           echo "=========================================="
-          echo "  PR Created Successfully!"
-          echo "  Subdominio: ${SUBDOMINIO}"
-          echo "  Folder: ${TARGET_FOLDER}"
-          echo "  PR: ${PR_URL}"
+          echo "  Request forwarded to Helix-Processor"
+          echo "  Subdominio: ${{ steps.export.outputs.subdominio }}"
           echo "=========================================="
 
       - name: Summary
         run: |
-          echo "## UAT Request Processed" >> $GITHUB_STEP_SUMMARY
-          echo "Request ID: ${{ steps.request-id.outputs.request_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "API: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" >> $GITHUB_STEP_SUMMARY
-          echo "Subdominio: ${{ steps.export-api.outputs.subdominio }}" >> $GITHUB_STEP_SUMMARY
-          echo "Backend: ${{ steps.export-api.outputs.backend_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "## WSO2 API Extracted" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Campo | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| API | ${{ inputs.apiName }} v${{ inputs.apiVersion }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Subdominio | ${{ steps.export.outputs.subdominio }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend | ${{ steps.export.outputs.backend_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Forwarded to Helix-Processor for processing." >> $GITHUB_STEP_SUMMARY
