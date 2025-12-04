@@ -65,7 +65,7 @@ jobs:
   process-uat-request:
     name: Process UAT Registration Request
     # Use self-hosted runner with 'apiops' label (deployed via docker-compose)
-    runs-on: [self-hosted, apiops]
+    runs-on: [self-hosted, linux, apiops]
 
     steps:
       - name: Checkout WSO2-Processor
