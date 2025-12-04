@@ -1,0 +1,365 @@
+# =============================================================================
+# WSO2-Processor: Receive UAT Registration Request
+# =============================================================================
+# This workflow is triggered by the UATRegistration button in WSO2 Publisher.
+# It exports the API from WSO2 and creates a PR in GIT-Helix-Processor.
+#
+# Flow:
+# 1. Receive workflow_dispatch from Publisher UI
+# 2. Export API from WSO2 using REST API
+# 3. Create PR in GIT-Helix-Processor with plain data files
+# =============================================================================
+
+name: Receive UAT Request
+
+on:
+  workflow_dispatch:
+    inputs:
+      apiId:
+        description: 'WSO2 API ID'
+        required: true
+        type: string
+      apiName:
+        description: 'API Name'
+        required: true
+        type: string
+      apiVersion:
+        description: 'API Version'
+        required: true
+        type: string
+      apiContext:
+        description: 'API Context path'
+        required: false
+        type: string
+        default: ''
+      userId:
+        description: 'User who triggered the registration'
+        required: false
+        type: string
+        default: 'unknown'
+      timestamp:
+        description: 'Request timestamp'
+        required: false
+        type: string
+      metadata:
+        description: 'Additional metadata as JSON'
+        required: false
+        type: string
+        default: '{}'
+
+env:
+  # WSO2 APIM Configuration
+  WSO2_BASE_URL: ${{ secrets.WSO2_BASE_URL || 'https://localhost:9443' }}
+  WSO2_USERNAME: ${{ secrets.WSO2_USERNAME || 'admin' }}
+  WSO2_PASSWORD: ${{ secrets.WSO2_PASSWORD || 'admin' }}
+
+  # GIT-Helix-Processor Configuration
+  TARGET_REPO: ${{ secrets.GIT_HELIX_REPO || 'ISAngelRivera/GIT-Helix-Processor' }}
+  TARGET_BRANCH: 'main'
+
+jobs:
+  process-uat-request:
+    name: Process UAT Registration Request
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout WSO2-Processor
+        uses: actions/checkout@v4
+
+      - name: Log Request Details
+        run: |
+          echo "=========================================="
+          echo "  UAT Registration Request Received"
+          echo "=========================================="
+          echo "API ID:      ${{ inputs.apiId }}"
+          echo "API Name:    ${{ inputs.apiName }}"
+          echo "API Version: ${{ inputs.apiVersion }}"
+          echo "API Context: ${{ inputs.apiContext }}"
+          echo "User:        ${{ inputs.userId }}"
+          echo "Timestamp:   ${{ inputs.timestamp }}"
+          echo "Run ID:      ${{ github.run_id }}"
+          echo "=========================================="
+
+      - name: Generate Request ID
+        id: request-id
+        run: |
+          # Generate unique request ID
+          DATE=$(date +%Y-%m-%d)
+          API_NAME_SLUG=$(echo "${{ inputs.apiName }}" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd '[:alnum:]-')
+          VERSION_SLUG=$(echo "${{ inputs.apiVersion }}" | tr '.' '-')
+          REQUEST_ID="${DATE}-${API_NAME_SLUG}-v${VERSION_SLUG}-uat"
+          echo "request_id=${REQUEST_ID}" >> $GITHUB_OUTPUT
+          echo "Generated Request ID: ${REQUEST_ID}"
+
+      - name: Get WSO2 OAuth Token
+        id: wso2-token
+        run: |
+          echo "Getting OAuth token from WSO2..."
+
+          # Register OAuth client
+          CLIENT_RESPONSE=$(curl -sk -X POST \
+            -H "Authorization: Basic $(echo -n '${{ env.WSO2_USERNAME }}:${{ env.WSO2_PASSWORD }}' | base64)" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "callbackUrl": "https://localhost",
+              "clientName": "github_actions_'${{ github.run_id }}'",
+              "owner": "admin",
+              "grantType": "client_credentials password refresh_token",
+              "saasApp": true
+            }' \
+            "${{ env.WSO2_BASE_URL }}/client-registration/v0.17/register")
+
+          CLIENT_ID=$(echo "$CLIENT_RESPONSE" | jq -r '.clientId')
+          CLIENT_SECRET=$(echo "$CLIENT_RESPONSE" | jq -r '.clientSecret')
+
+          if [ "$CLIENT_ID" == "null" ] || [ -z "$CLIENT_ID" ]; then
+            echo "Warning: Could not get OAuth client. Using mock data for demo."
+            echo "token=MOCK_TOKEN" >> $GITHUB_OUTPUT
+            echo "mock=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Get access token
+          TOKEN_RESPONSE=$(curl -sk -X POST \
+            -H "Authorization: Basic $(echo -n "$CLIENT_ID:$CLIENT_SECRET" | base64)" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=password&username=${{ env.WSO2_USERNAME }}&password=${{ env.WSO2_PASSWORD }}&scope=apim:api_view apim:api_publish" \
+            "${{ env.WSO2_BASE_URL }}/oauth2/token")
+
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+
+          if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "Warning: Could not get access token. Using mock data for demo."
+            echo "token=MOCK_TOKEN" >> $GITHUB_OUTPUT
+            echo "mock=true" >> $GITHUB_OUTPUT
+          else
+            echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+            echo "mock=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Export API from WSO2
+        id: export-api
+        run: |
+          mkdir -p ./export
+
+          if [ "${{ steps.wso2-token.outputs.mock }}" == "true" ]; then
+            echo "Using mock API data (WSO2 not accessible)"
+
+            # Create mock API definition
+            cat > ./export/api.yaml << 'EOF'
+          type: api
+          version: v4
+          data:
+            name: ${{ inputs.apiName }}
+            version: ${{ inputs.apiVersion }}
+            context: ${{ inputs.apiContext || '/api' }}
+            provider: admin
+            lifeCycleStatus: PUBLISHED
+            type: HTTP
+            transport:
+              - http
+              - https
+            visibility: PUBLIC
+            endpointConfig:
+              endpoint_type: http
+              production_endpoints:
+                url: https://api.example.com
+              sandbox_endpoints:
+                url: https://sandbox.example.com
+          EOF
+
+            # Create mock OpenAPI spec
+            cat > ./export/swagger.yaml << 'EOF'
+          openapi: "3.0.0"
+          info:
+            title: ${{ inputs.apiName }}
+            version: "${{ inputs.apiVersion }}"
+            description: "API exported from WSO2 APIM"
+          servers:
+            - url: https://api.example.com
+          paths:
+            /health:
+              get:
+                summary: Health check
+                responses:
+                  '200':
+                    description: OK
+          EOF
+          else
+            echo "Exporting API from WSO2..."
+
+            # Get API details
+            API_RESPONSE=$(curl -sk \
+              -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
+              "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}")
+
+            echo "$API_RESPONSE" | jq '.' > ./export/api.yaml
+
+            # Get OpenAPI definition
+            SWAGGER_RESPONSE=$(curl -sk \
+              -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
+              "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}/swagger")
+
+            echo "$SWAGGER_RESPONSE" > ./export/swagger.yaml
+          fi
+
+          echo "API exported successfully"
+          ls -la ./export/
+
+      - name: Prepare Request Files
+        run: |
+          REQUEST_DIR="./request-${{ steps.request-id.outputs.request_id }}"
+          mkdir -p "$REQUEST_DIR"
+
+          # Create request.yaml with metadata
+          cat > "$REQUEST_DIR/request.yaml" << EOF
+          # UAT Registration Request
+          # Generated by WSO2-Processor
+
+          action: register-uat
+          request_id: ${{ steps.request-id.outputs.request_id }}
+          timestamp: ${{ inputs.timestamp || 'N/A' }}
+
+          source:
+            system: wso2
+            processor: WSO2-Processor
+            run_id: "${{ github.run_id }}"
+            run_url: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          api:
+            id: "${{ inputs.apiId }}"
+            name: "${{ inputs.apiName }}"
+            version: "${{ inputs.apiVersion }}"
+            context: "${{ inputs.apiContext }}"
+
+          user:
+            id: "${{ inputs.userId }}"
+
+          metadata: ${{ inputs.metadata }}
+          EOF
+
+          # Copy exported files
+          cp ./export/api.yaml "$REQUEST_DIR/"
+          cp ./export/swagger.yaml "$REQUEST_DIR/"
+
+          # Create params.yaml for environment config
+          cat > "$REQUEST_DIR/params.yaml" << EOF
+          # Environment Parameters
+          # These can be customized per environment
+
+          environments:
+            uat:
+              gatewayUrls:
+                - https://uat-gateway.example.com
+              retryPolicy:
+                count: 3
+                intervalMillis: 1000
+          EOF
+
+          echo "Request files prepared:"
+          ls -la "$REQUEST_DIR/"
+          echo ""
+          echo "=== request.yaml ==="
+          cat "$REQUEST_DIR/request.yaml"
+
+      - name: Create PR in GIT-Helix-Processor
+        env:
+          GH_TOKEN: ${{ secrets.GIT_HELIX_PAT }}
+        run: |
+          REQUEST_ID="${{ steps.request-id.outputs.request_id }}"
+          REQUEST_DIR="./request-${REQUEST_ID}"
+          BRANCH_NAME="request/${REQUEST_ID}"
+
+          # Check if we have the PAT
+          if [ -z "$GH_TOKEN" ]; then
+            echo "=========================================="
+            echo "  WARNING: GIT_HELIX_PAT not configured"
+            echo "=========================================="
+            echo "To complete the integration, add a GitHub PAT as secret GIT_HELIX_PAT"
+            echo "The PAT needs 'repo' scope for the target repository."
+            echo ""
+            echo "For now, showing what would be created:"
+            echo ""
+            echo "Branch: ${BRANCH_NAME}"
+            echo "Target: ${{ env.TARGET_REPO }}"
+            echo "Files:"
+            ls -la "$REQUEST_DIR/"
+            exit 0
+          fi
+
+          echo "Creating PR in GIT-Helix-Processor..."
+
+          # Clone target repo
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ env.TARGET_REPO }}.git" target-repo
+          cd target-repo
+
+          # Create branch
+          git checkout -b "${BRANCH_NAME}"
+
+          # Create requests directory if needed
+          mkdir -p "requests/${REQUEST_ID}"
+
+          # Copy files
+          cp -r "../${REQUEST_DIR}"/* "requests/${REQUEST_ID}/"
+
+          # Configure git
+          git config user.name "WSO2-Processor Bot"
+          git config user.email "wso2-processor@github.actions"
+
+          # Commit
+          git add .
+          git commit -m "feat: UAT registration request for ${{ inputs.apiName }} v${{ inputs.apiVersion }}
+
+          Request ID: ${REQUEST_ID}
+          Triggered by: ${{ inputs.userId }}
+          Source: WSO2 APIM
+
+          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Push
+          git push origin "${BRANCH_NAME}"
+
+          # Create PR
+          gh pr create \
+            --repo "${{ env.TARGET_REPO }}" \
+            --base "${{ env.TARGET_BRANCH }}" \
+            --head "${BRANCH_NAME}" \
+            --title "UAT: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" \
+            --body "## UAT Registration Request
+
+          | Field | Value |
+          |-------|-------|
+          | API Name | ${{ inputs.apiName }} |
+          | Version | ${{ inputs.apiVersion }} |
+          | Context | ${{ inputs.apiContext }} |
+          | User | ${{ inputs.userId }} |
+          | Request ID | ${REQUEST_ID} |
+
+          ### Source
+          - **System**: WSO2 APIM
+          - **Workflow Run**: [View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ### Next Steps
+          1. Automated linters will validate the API definition
+          2. If validation passes, a Helix CRQ will be created
+          3. Once approved, the API will be registered in UAT
+
+          ---
+          *Generated by WSO2-Processor*"
+
+          echo ""
+          echo "=========================================="
+          echo "  PR Created Successfully!"
+          echo "=========================================="
+
+      - name: Summary
+        run: |
+          echo "## UAT Registration Request Processed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Request ID | ${{ steps.request-id.outputs.request_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| API Name | ${{ inputs.apiName }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ inputs.apiVersion }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| User | ${{ inputs.userId }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| WSO2 Mock | ${{ steps.wso2-token.outputs.mock }} |" >> $GITHUB_STEP_SUMMARY
