@@ -272,27 +272,43 @@ jobs:
 
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ env.TARGET_REPO }}.git" target-repo
           cd target-repo
+          git config user.name "WSO2-Processor Bot"
+          git config user.email "wso2-processor@github.actions"
+
+          # Check if branch already exists remotely
+          if git ls-remote --heads origin "${BRANCH_NAME}" | grep -q "${BRANCH_NAME}"; then
+            echo "Branch ${BRANCH_NAME} already exists, deleting it first..."
+            git push origin --delete "${BRANCH_NAME}" || true
+          fi
+
           git checkout -b "${BRANCH_NAME}"
           mkdir -p "${TARGET_FOLDER}"
           cp -r "../${REQUEST_DIR}"/* "${TARGET_FOLDER}/"
-          git config user.name "WSO2-Processor Bot"
-          git config user.email "wso2-processor@github.actions"
           git add .
           git commit -m "feat(${SUBDOMINIO}): UAT request for ${{ inputs.apiName }} v${{ inputs.apiVersion }}"
           git push origin "${BRANCH_NAME}"
 
-          gh pr create \
-            --repo "${{ env.TARGET_REPO }}" \
-            --base "${{ env.TARGET_BRANCH }}" \
-            --head "${BRANCH_NAME}" \
-            --title "UAT [${SUBDOMINIO}]: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" \
-            --body "UAT Registration - API: ${{ inputs.apiName }} v${{ inputs.apiVersion }} - Subdominio: ${SUBDOMINIO} - Request ID: ${REQUEST_ID} - User: ${{ inputs.userId }} - Files: ${TARGET_FOLDER}/"
+          # Check if PR already exists
+          EXISTING_PR=$(gh pr list --repo "${{ env.TARGET_REPO }}" --head "${BRANCH_NAME}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already exists for this branch"
+            PR_URL="https://github.com/${{ env.TARGET_REPO }}/pull/${EXISTING_PR}"
+          else
+            PR_URL=$(gh pr create \
+              --repo "${{ env.TARGET_REPO }}" \
+              --base "${{ env.TARGET_BRANCH }}" \
+              --head "${BRANCH_NAME}" \
+              --title "UAT [${SUBDOMINIO}]: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" \
+              --body "UAT Registration - API: ${{ inputs.apiName }} v${{ inputs.apiVersion }} - Subdominio: ${SUBDOMINIO} - Request ID: ${REQUEST_ID} - User: ${{ inputs.userId }} - Files: ${TARGET_FOLDER}/")
+          fi
 
           echo ""
           echo "=========================================="
           echo "  PR Created Successfully!"
           echo "  Subdominio: ${SUBDOMINIO}"
           echo "  Folder: ${TARGET_FOLDER}"
+          echo "  PR: ${PR_URL}"
           echo "=========================================="
 
       - name: Summary
