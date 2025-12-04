@@ -4,9 +4,11 @@
 # This workflow is triggered by the UATRegistration button in WSO2 Publisher.
 # It exports the API from WSO2 and creates a PR in GIT-Helix-Processor.
 #
+# RUNNER: Uses self-hosted runner with label 'apiops' to access WSO2 locally
+#
 # Flow:
 # 1. Receive workflow_dispatch from Publisher UI
-# 2. Export API from WSO2 using REST API
+# 2. Export API from WSO2 using REST API (via Docker network: wso2-apim:9443)
 # 3. Create PR in GIT-Helix-Processor with plain data files
 # =============================================================================
 
@@ -49,7 +51,9 @@ on:
 
 env:
   # WSO2 APIM Configuration
-  WSO2_BASE_URL: ${{ secrets.WSO2_BASE_URL || 'https://localhost:9443' }}
+  # When running on self-hosted runner in Docker, WSO2 is at wso2-apim:9443
+  # Environment variable WSO2_BASE_URL is set by docker-compose for the runner
+  WSO2_BASE_URL: ${{ secrets.WSO2_BASE_URL || 'https://wso2-apim:9443' }}
   WSO2_USERNAME: ${{ secrets.WSO2_USERNAME || 'admin' }}
   WSO2_PASSWORD: ${{ secrets.WSO2_PASSWORD || 'admin' }}
 
@@ -60,7 +64,8 @@ env:
 jobs:
   process-uat-request:
     name: Process UAT Registration Request
-    runs-on: ubuntu-latest
+    # Use self-hosted runner with 'apiops' label (deployed via docker-compose)
+    runs-on: [self-hosted, apiops]
 
     steps:
       - name: Checkout WSO2-Processor
@@ -78,6 +83,10 @@ jobs:
           echo "User:        ${{ inputs.userId }}"
           echo "Timestamp:   ${{ inputs.timestamp }}"
           echo "Run ID:      ${{ github.run_id }}"
+          echo ""
+          echo "Runner Info:"
+          echo "  WSO2_BASE_URL: ${{ env.WSO2_BASE_URL }}"
+          echo "  Runner Name:   $(hostname)"
           echo "=========================================="
 
       - name: Generate Request ID
@@ -95,6 +104,7 @@ jobs:
         id: wso2-token
         run: |
           echo "Getting OAuth token from WSO2..."
+          echo "Target: ${{ env.WSO2_BASE_URL }}"
 
           # Register OAuth client
           CLIENT_RESPONSE=$(curl -sk -X POST \
@@ -109,15 +119,20 @@ jobs:
             }' \
             "${{ env.WSO2_BASE_URL }}/client-registration/v0.17/register")
 
+          echo "Client registration response received"
+
           CLIENT_ID=$(echo "$CLIENT_RESPONSE" | jq -r '.clientId')
           CLIENT_SECRET=$(echo "$CLIENT_RESPONSE" | jq -r '.clientSecret')
 
           if [ "$CLIENT_ID" == "null" ] || [ -z "$CLIENT_ID" ]; then
-            echo "Warning: Could not get OAuth client. Using mock data for demo."
+            echo "ERROR: Could not register OAuth client"
+            echo "Response: $CLIENT_RESPONSE"
             echo "token=MOCK_TOKEN" >> $GITHUB_OUTPUT
             echo "mock=true" >> $GITHUB_OUTPUT
             exit 0
           fi
+
+          echo "OAuth client registered: $CLIENT_ID"
 
           # Get access token
           TOKEN_RESPONSE=$(curl -sk -X POST \
@@ -129,10 +144,11 @@ jobs:
           ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
 
           if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
-            echo "Warning: Could not get access token. Using mock data for demo."
+            echo "ERROR: Could not get access token"
             echo "token=MOCK_TOKEN" >> $GITHUB_OUTPUT
             echo "mock=true" >> $GITHUB_OUTPUT
           else
+            echo "Access token obtained successfully"
             echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
             echo "mock=false" >> $GITHUB_OUTPUT
           fi
@@ -143,48 +159,48 @@ jobs:
           mkdir -p ./export
 
           if [ "${{ steps.wso2-token.outputs.mock }}" == "true" ]; then
-            echo "Using mock API data (WSO2 not accessible)"
+            echo "Using mock API data (WSO2 connection failed)"
 
             # Create mock API definition
             cat > ./export/api.yaml << 'EOF'
-          type: api
-          version: v4
-          data:
-            name: ${{ inputs.apiName }}
-            version: ${{ inputs.apiVersion }}
-            context: ${{ inputs.apiContext || '/api' }}
-            provider: admin
-            lifeCycleStatus: PUBLISHED
-            type: HTTP
-            transport:
-              - http
-              - https
-            visibility: PUBLIC
-            endpointConfig:
-              endpoint_type: http
-              production_endpoints:
-                url: https://api.example.com
-              sandbox_endpoints:
-                url: https://sandbox.example.com
-          EOF
+type: api
+version: v4
+data:
+  name: ${{ inputs.apiName }}
+  version: ${{ inputs.apiVersion }}
+  context: ${{ inputs.apiContext || '/api' }}
+  provider: admin
+  lifeCycleStatus: PUBLISHED
+  type: HTTP
+  transport:
+    - http
+    - https
+  visibility: PUBLIC
+  endpointConfig:
+    endpoint_type: http
+    production_endpoints:
+      url: https://api.example.com
+    sandbox_endpoints:
+      url: https://sandbox.example.com
+EOF
 
             # Create mock OpenAPI spec
             cat > ./export/swagger.yaml << 'EOF'
-          openapi: "3.0.0"
-          info:
-            title: ${{ inputs.apiName }}
-            version: "${{ inputs.apiVersion }}"
-            description: "API exported from WSO2 APIM"
-          servers:
-            - url: https://api.example.com
-          paths:
-            /health:
-              get:
-                summary: Health check
-                responses:
-                  '200':
-                    description: OK
-          EOF
+openapi: "3.0.0"
+info:
+  title: ${{ inputs.apiName }}
+  version: "${{ inputs.apiVersion }}"
+  description: "API exported from WSO2 APIM"
+servers:
+  - url: https://api.example.com
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+EOF
           else
             echo "Exporting API from WSO2..."
 
@@ -201,9 +217,11 @@ jobs:
               "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}/swagger")
 
             echo "$SWAGGER_RESPONSE" > ./export/swagger.yaml
+
+            echo "API exported from WSO2 successfully!"
           fi
 
-          echo "API exported successfully"
+          echo "Export files:"
           ls -la ./export/
 
       - name: Prepare Request Files
@@ -213,30 +231,31 @@ jobs:
 
           # Create request.yaml with metadata
           cat > "$REQUEST_DIR/request.yaml" << EOF
-          # UAT Registration Request
-          # Generated by WSO2-Processor
+# UAT Registration Request
+# Generated by WSO2-Processor
 
-          action: register-uat
-          request_id: ${{ steps.request-id.outputs.request_id }}
-          timestamp: ${{ inputs.timestamp || 'N/A' }}
+action: register-uat
+request_id: ${{ steps.request-id.outputs.request_id }}
+timestamp: ${{ inputs.timestamp || 'N/A' }}
 
-          source:
-            system: wso2
-            processor: WSO2-Processor
-            run_id: "${{ github.run_id }}"
-            run_url: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+source:
+  system: wso2
+  processor: WSO2-Processor
+  run_id: "${{ github.run_id }}"
+  run_url: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+  runner: self-hosted
 
-          api:
-            id: "${{ inputs.apiId }}"
-            name: "${{ inputs.apiName }}"
-            version: "${{ inputs.apiVersion }}"
-            context: "${{ inputs.apiContext }}"
+api:
+  id: "${{ inputs.apiId }}"
+  name: "${{ inputs.apiName }}"
+  version: "${{ inputs.apiVersion }}"
+  context: "${{ inputs.apiContext }}"
 
-          user:
-            id: "${{ inputs.userId }}"
+user:
+  id: "${{ inputs.userId }}"
 
-          metadata: ${{ inputs.metadata }}
-          EOF
+metadata: ${{ inputs.metadata }}
+EOF
 
           # Copy exported files
           cp ./export/api.yaml "$REQUEST_DIR/"
@@ -244,17 +263,17 @@ jobs:
 
           # Create params.yaml for environment config
           cat > "$REQUEST_DIR/params.yaml" << EOF
-          # Environment Parameters
-          # These can be customized per environment
+# Environment Parameters
+# These can be customized per environment
 
-          environments:
-            uat:
-              gatewayUrls:
-                - https://uat-gateway.example.com
-              retryPolicy:
-                count: 3
-                intervalMillis: 1000
-          EOF
+environments:
+  uat:
+    gatewayUrls:
+      - https://uat-gateway.example.com
+    retryPolicy:
+      count: 3
+      intervalMillis: 1000
+EOF
 
           echo "Request files prepared:"
           ls -la "$REQUEST_DIR/"
@@ -310,11 +329,11 @@ jobs:
           git add .
           git commit -m "feat: UAT registration request for ${{ inputs.apiName }} v${{ inputs.apiVersion }}
 
-          Request ID: ${REQUEST_ID}
-          Triggered by: ${{ inputs.userId }}
-          Source: WSO2 APIM
+Request ID: ${REQUEST_ID}
+Triggered by: ${{ inputs.userId }}
+Source: WSO2 APIM (self-hosted runner)
 
-          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Push
           git push origin "${BRANCH_NAME}"
@@ -327,25 +346,26 @@ jobs:
             --title "UAT: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" \
             --body "## UAT Registration Request
 
-          | Field | Value |
-          |-------|-------|
-          | API Name | ${{ inputs.apiName }} |
-          | Version | ${{ inputs.apiVersion }} |
-          | Context | ${{ inputs.apiContext }} |
-          | User | ${{ inputs.userId }} |
-          | Request ID | ${REQUEST_ID} |
+| Field | Value |
+|-------|-------|
+| API Name | ${{ inputs.apiName }} |
+| Version | ${{ inputs.apiVersion }} |
+| Context | ${{ inputs.apiContext }} |
+| User | ${{ inputs.userId }} |
+| Request ID | ${REQUEST_ID} |
 
-          ### Source
-          - **System**: WSO2 APIM
-          - **Workflow Run**: [View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+### Source
+- **System**: WSO2 APIM
+- **Runner**: Self-hosted (apiops)
+- **Workflow Run**: [View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
-          ### Next Steps
-          1. Automated linters will validate the API definition
-          2. If validation passes, a Helix CRQ will be created
-          3. Once approved, the API will be registered in UAT
+### Next Steps
+1. Automated linters will validate the API definition
+2. If validation passes, a Helix CRQ will be created
+3. Once approved, the API will be registered in UAT
 
-          ---
-          *Generated by WSO2-Processor*"
+---
+*Generated by WSO2-Processor (self-hosted runner)*"
 
           echo ""
           echo "=========================================="
@@ -363,3 +383,4 @@ jobs:
           echo "| Version | ${{ inputs.apiVersion }} |" >> $GITHUB_STEP_SUMMARY
           echo "| User | ${{ inputs.userId }} |" >> $GITHUB_STEP_SUMMARY
           echo "| WSO2 Mock | ${{ steps.wso2-token.outputs.mock }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Runner | Self-hosted (apiops) |" >> $GITHUB_STEP_SUMMARY
