@@ -2,6 +2,7 @@
 # WSO2-Processor: Extractor de APIs de WSO2
 # =============================================================================
 # Vendor-específico: Solo extrae datos de WSO2 y los pasa a Helix-Processor
+# Usa apictl export para obtener el backup completo de la API
 # NO contiene lógica de negocio, Helix, ni almacenamiento
 # =============================================================================
 name: Receive UAT Request
@@ -37,7 +38,8 @@ on:
         type: string
 
 env:
-  WSO2_BASE_URL: https://wso2-apim:9443
+  WSO2_HOST: wso2-apim
+  WSO2_PORT: "9443"
   WSO2_USERNAME: admin
   WSO2_PASSWORD: admin
   HELIX_PROCESSOR_REPO: ISAngelRivera/GIT-Helix-Processor
@@ -59,64 +61,98 @@ jobs:
           echo "User:        ${{ inputs.userId }}"
           echo "=========================================="
 
-      - name: Get WSO2 OAuth Token
-        id: wso2-token
+      - name: Setup apictl environment
         run: |
-          echo "Getting OAuth token from WSO2..."
+          echo "Configuring apictl environment..."
 
-          CLIENT_RESPONSE=$(curl -sk -X POST \
-            -H "Authorization: Basic $(echo -n 'admin:admin' | base64)" \
-            -H "Content-Type: application/json" \
-            -d '{"callbackUrl":"https://localhost","clientName":"wso2_processor_${{ github.run_id }}","owner":"admin","grantType":"client_credentials password refresh_token","saasApp":true}' \
-            "${{ env.WSO2_BASE_URL }}/client-registration/v0.17/register" 2>/dev/null || echo '{}')
+          # Limpiar ambiente anterior si existe
+          ~/.local/bin/apictl/apictl remove env wso2-docker 2>/dev/null || true
 
-          CLIENT_ID=$(echo "$CLIENT_RESPONSE" | jq -r '.clientId // empty')
-          CLIENT_SECRET=$(echo "$CLIENT_RESPONSE" | jq -r '.clientSecret // empty')
+          # Añadir ambiente
+          ~/.local/bin/apictl/apictl add env wso2-docker \
+            --apim "https://${{ env.WSO2_HOST }}:${{ env.WSO2_PORT }}"
 
-          if [ -z "$CLIENT_ID" ]; then
-            echo "ERROR: WSO2 not reachable"
-            exit 1
-          fi
+          echo "Environment configured"
 
-          TOKEN_RESPONSE=$(curl -sk -X POST \
-            -H "Authorization: Basic $(echo -n "$CLIENT_ID:$CLIENT_SECRET" | base64)" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "grant_type=password&username=admin&password=admin&scope=apim:api_view" \
-            "${{ env.WSO2_BASE_URL }}/oauth2/token" 2>/dev/null || echo '{}')
+      - name: Login to WSO2
+        run: |
+          echo "Logging into WSO2..."
 
-          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+          ~/.local/bin/apictl/apictl login wso2-docker \
+            -u ${{ env.WSO2_USERNAME }} \
+            -p ${{ env.WSO2_PASSWORD }} \
+            -k
 
-          if [ -z "$ACCESS_TOKEN" ]; then
-            echo "ERROR: Could not get access token"
-            exit 1
-          fi
+          echo "Login successful"
 
-          echo "token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
-          echo "Token obtained"
-
-      - name: Export API from WSO2
+      - name: Export API with apictl
         id: export
         run: |
-          echo "Exporting API from WSO2..."
+          echo "Exporting API with apictl..."
 
-          # Exportar api.json
-          API_JSON=$(curl -sk -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
-            "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}")
+          EXPORT_DIR="./export-output"
+          mkdir -p "$EXPORT_DIR"
 
-          # Exportar swagger.json
-          SWAGGER_JSON=$(curl -sk -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
-            "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}/swagger")
+          # Exportar API completa (genera ZIP con toda la estructura)
+          ~/.local/bin/apictl/apictl export api \
+            --name "${{ inputs.apiName }}" \
+            --version "${{ inputs.apiVersion }}" \
+            --provider admin \
+            --environment wso2-docker \
+            --format JSON \
+            -k
+
+          # Encontrar el ZIP exportado
+          ZIP_FILE=$(find ~/.wso2apictl/exported/apis/wso2-docker -name "*.zip" -type f -newer /tmp 2>/dev/null | head -1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No se encontró el archivo ZIP exportado"
+            exit 1
+          fi
+
+          echo "ZIP exportado: $ZIP_FILE"
+
+          # Copiar ZIP a directorio de trabajo
+          cp "$ZIP_FILE" "$EXPORT_DIR/api-export.zip"
+
+          # Descomprimir para leer datos
+          unzip -q "$EXPORT_DIR/api-export.zip" -d "$EXPORT_DIR/extracted"
+
+          # Leer api.json o api.yaml para extraer metadatos
+          API_DIR=$(find "$EXPORT_DIR/extracted" -type d -name "${{ inputs.apiName }}-${{ inputs.apiVersion }}" | head -1)
+
+          if [ -z "$API_DIR" ]; then
+            API_DIR=$(find "$EXPORT_DIR/extracted" -type d -mindepth 1 -maxdepth 1 | head -1)
+          fi
+
+          echo "API_DIR: $API_DIR"
+          ls -la "$API_DIR" || true
+
+          # Leer api.yaml o api.json
+          if [ -f "$API_DIR/api.json" ]; then
+            API_DATA=$(cat "$API_DIR/api.json")
+          elif [ -f "$API_DIR/api.yaml" ]; then
+            # Convertir YAML a JSON si es necesario
+            API_DATA=$(python3 -c "import yaml, json, sys; print(json.dumps(yaml.safe_load(open('$API_DIR/api.yaml'))))" 2>/dev/null || cat "$API_DIR/api.yaml")
+          else
+            echo "ERROR: No se encontró api.json ni api.yaml"
+            ls -laR "$EXPORT_DIR/extracted"
+            exit 1
+          fi
 
           # Extraer subdominio de additionalProperties
-          SUBDOMINIO=$(echo "$API_JSON" | jq -r '.additionalProperties[]? | select(.name=="subdominio") | .value // empty')
+          SUBDOMINIO=$(echo "$API_DATA" | jq -r '.data.additionalProperties[]? | select(.name=="subdominio") | .value // empty' 2>/dev/null)
 
-          # Si no está, buscar en additionalPropertiesMap
+          # Intentar otras ubicaciones
           if [ -z "$SUBDOMINIO" ]; then
-            SUBDOMINIO=$(echo "$API_JSON" | jq -r '.additionalPropertiesMap.subdominio // empty')
+            SUBDOMINIO=$(echo "$API_DATA" | jq -r '.additionalProperties[]? | select(.name=="subdominio") | .value // empty' 2>/dev/null)
+          fi
+          if [ -z "$SUBDOMINIO" ]; then
+            SUBDOMINIO=$(echo "$API_DATA" | jq -r '.data.additionalPropertiesMap.subdominio // empty' 2>/dev/null)
           fi
 
           # Extraer backend URL
-          BACKEND_URL=$(echo "$API_JSON" | jq -r '.endpointConfig.production_endpoints.url // "unknown"')
+          BACKEND_URL=$(echo "$API_DATA" | jq -r '.data.endpointConfig.production_endpoints.url // .endpointConfig.production_endpoints.url // "unknown"' 2>/dev/null)
 
           echo "Subdominio: $SUBDOMINIO"
           echo "Backend: $BACKEND_URL"
@@ -133,25 +169,34 @@ jobs:
             echo "2. Properties > Additional Properties"
             echo "3. Añade: subdominio = <nombre-subdominio>"
             echo ""
+            echo "DEBUG - Contenido de api.yaml/api.json:"
+            echo "$API_DATA" | head -100
             exit 1
           fi
 
-          # Codificar en base64 para pasar al siguiente workflow
-          API_JSON_B64=$(echo "$API_JSON" | base64 -w 0)
-          SWAGGER_JSON_B64=$(echo "$SWAGGER_JSON" | base64 -w 0)
+          # Codificar el ZIP completo en base64
+          API_EXPORT_B64=$(base64 -w 0 "$EXPORT_DIR/api-export.zip")
+
+          # Guardar en archivo para evitar límites de variable
+          echo "$API_EXPORT_B64" > /tmp/api_export_b64.txt
 
           echo "subdominio=$SUBDOMINIO" >> $GITHUB_OUTPUT
           echo "backend_url=$BACKEND_URL" >> $GITHUB_OUTPUT
-          echo "api_json_b64=$API_JSON_B64" >> $GITHUB_OUTPUT
-          echo "swagger_json_b64=$SWAGGER_JSON_B64" >> $GITHUB_OUTPUT
+          echo "export_file=/tmp/api_export_b64.txt" >> $GITHUB_OUTPUT
 
+          echo ""
           echo "API exported successfully"
+          echo "ZIP size: $(du -h "$EXPORT_DIR/api-export.zip" | cut -f1)"
+          echo "Base64 size: $(du -h /tmp/api_export_b64.txt | cut -f1)"
 
       - name: Forward to Helix-Processor
         env:
           GH_TOKEN: ${{ secrets.GIT_HELIX_PAT }}
         run: |
           echo "Forwarding to Helix-Processor..."
+
+          # Leer base64 del archivo
+          API_EXPORT_B64=$(cat /tmp/api_export_b64.txt)
 
           # Llamar al workflow de Helix-Processor
           gh workflow run process-api-request.yml \
@@ -161,8 +206,7 @@ jobs:
             -f apiVersion="${{ inputs.apiVersion }}" \
             -f apiContext="${{ inputs.apiContext }}" \
             -f backendUrl="${{ steps.export.outputs.backend_url }}" \
-            -f apiJson="${{ steps.export.outputs.api_json_b64 }}" \
-            -f swaggerJson="${{ steps.export.outputs.swagger_json_b64 }}" \
+            -f apiExportZip="$API_EXPORT_B64" \
             -f sourceSystem="wso2" \
             -f userId="${{ inputs.userId }}" \
             -f sourceRunUrl="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -173,6 +217,12 @@ jobs:
           echo "  Subdominio: ${{ steps.export.outputs.subdominio }}"
           echo "=========================================="
 
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf ./export-output /tmp/api_export_b64.txt
+          ~/.local/bin/apictl/apictl logout wso2-docker 2>/dev/null || true
+
       - name: Summary
         run: |
           echo "## WSO2 API Extracted" >> $GITHUB_STEP_SUMMARY
@@ -182,5 +232,6 @@ jobs:
           echo "| API | ${{ inputs.apiName }} v${{ inputs.apiVersion }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Subdominio | ${{ steps.export.outputs.subdominio }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Backend | ${{ steps.export.outputs.backend_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Export | apictl export (ZIP completo) |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Forwarded to Helix-Processor for processing." >> $GITHUB_STEP_SUMMARY
