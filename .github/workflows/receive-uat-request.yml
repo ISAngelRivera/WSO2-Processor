@@ -1,9 +1,8 @@
 # =============================================================================
 # WSO2-Processor: Receive UAT Registration Request
 # =============================================================================
-# Organiza las APIs por dominio de backend:
-# - domain-a/ para APIs que apuntan a api.domain-a.com
-# - domain-b/ para APIs que apuntan a api.domain-b.com
+# Organiza las APIs por subdominio basándose en repo-config.yaml
+# El subdominio se determina por el backend URL de la API
 # =============================================================================
 name: Receive UAT Request
 
@@ -119,7 +118,7 @@ jobs:
             echo "mock=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Export API and Determine Domain
+      - name: Export API from WSO2
         id: export-api
         run: |
           mkdir -p ./export
@@ -141,35 +140,75 @@ jobs:
           fi
 
           echo "Backend URL: $BACKEND_URL"
-
-          # Determinar dominio basado en el backend URL
-          if echo "$BACKEND_URL" | grep -q "domain-a"; then
-            DOMAIN="domain-a"
-          elif echo "$BACKEND_URL" | grep -q "domain-b"; then
-            DOMAIN="domain-b"
-          else
-            DOMAIN="other"
-          fi
-
-          echo "Detected domain: $DOMAIN"
-          echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
           echo "backend_url=$BACKEND_URL" >> $GITHUB_OUTPUT
 
           echo "Export files:"
           ls -la ./export/
 
+      - name: Fetch repo-config and determine subdomain
+        id: subdomain
+        env:
+          GH_TOKEN: ${{ secrets.GIT_HELIX_PAT }}
+        run: |
+          BACKEND_URL="${{ steps.export-api.outputs.backend_url }}"
+          echo "Looking up subdomain for backend: $BACKEND_URL"
+
+          SUBDOMAIN="otros"
+
+          # Intentar descargar repo-config.yaml del repo destino
+          if [ -n "$GH_TOKEN" ]; then
+            REPO_CONFIG=$(curl -sk -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              "https://api.github.com/repos/${{ env.TARGET_REPO }}/contents/repo-config.yaml" 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$REPO_CONFIG" ] || echo "$REPO_CONFIG" | grep -q "Not Found"; then
+            echo "repo-config.yaml not found, using default mapping"
+            if echo "$BACKEND_URL" | grep -q "domain-a"; then
+              SUBDOMAIN="finanzas-pagos"
+            elif echo "$BACKEND_URL" | grep -q "domain-b"; then
+              SUBDOMAIN="rrhh-empleados"
+            fi
+          else
+            echo "Found repo-config.yaml, searching for matching pattern..."
+            echo "$REPO_CONFIG" > /tmp/repo-config.yaml
+
+            # Buscar subdominios y sus patterns usando grep/awk
+            CURRENT_SUB=""
+            while IFS= read -r line; do
+              # Detectar nombre de subdominio (línea que termina en :)
+              if echo "$line" | grep -qE "^  [a-z].*:$"; then
+                CURRENT_SUB=$(echo "$line" | sed 's/://g' | tr -d ' ')
+              fi
+              # Detectar patterns
+              if echo "$line" | grep -qE "^\s+- "; then
+                PATTERN=$(echo "$line" | sed 's/.*- //' | tr -d '"' | tr -d "'")
+                # Convertir pattern a grep compatible
+                GREP_PATTERN=$(echo "$PATTERN" | sed 's/\./\\./g' | sed 's/\*/.*/g')
+                if echo "$BACKEND_URL" | grep -qE "$GREP_PATTERN"; then
+                  SUBDOMAIN="$CURRENT_SUB"
+                  echo "Matched pattern: $PATTERN -> subdomain: $SUBDOMAIN"
+                  break
+                fi
+              fi
+            done < /tmp/repo-config.yaml
+          fi
+
+          echo "Determined subdomain: $SUBDOMAIN"
+          echo "subdomain=$SUBDOMAIN" >> $GITHUB_OUTPUT
+
       - name: Prepare Request Files
         id: prepare-files
         run: |
           REQUEST_ID="${{ steps.request-id.outputs.request_id }}"
-          DOMAIN="${{ steps.export-api.outputs.domain }}"
+          SUBDOMAIN="${{ steps.subdomain.outputs.subdomain }}"
           REQUEST_DIR="./request-${REQUEST_ID}"
           mkdir -p "$REQUEST_DIR"
 
           echo "action: register-uat" > "$REQUEST_DIR/request.yaml"
           echo "request_id: ${REQUEST_ID}" >> "$REQUEST_DIR/request.yaml"
           echo "timestamp: ${{ inputs.timestamp }}" >> "$REQUEST_DIR/request.yaml"
-          echo "domain: ${DOMAIN}" >> "$REQUEST_DIR/request.yaml"
+          echo "subdomain: ${SUBDOMAIN}" >> "$REQUEST_DIR/request.yaml"
           echo "backend_url: ${{ steps.export-api.outputs.backend_url }}" >> "$REQUEST_DIR/request.yaml"
           echo "api:" >> "$REQUEST_DIR/request.yaml"
           echo "  id: ${{ inputs.apiId }}" >> "$REQUEST_DIR/request.yaml"
@@ -194,11 +233,11 @@ jobs:
         run: |
           REQUEST_ID="${{ steps.request-id.outputs.request_id }}"
           REQUEST_DIR="./request-${REQUEST_ID}"
-          DOMAIN="${{ steps.export-api.outputs.domain }}"
+          SUBDOMAIN="${{ steps.subdomain.outputs.subdomain }}"
           BRANCH_NAME="request/${REQUEST_ID}"
 
-          # Carpeta destino basada en dominio
-          TARGET_FOLDER="${DOMAIN}/requests/${REQUEST_ID}"
+          # Carpeta destino basada en subdominio
+          TARGET_FOLDER="subdominios/${SUBDOMAIN}/requests/${REQUEST_ID}"
 
           if [ -z "$GH_TOKEN" ]; then
             echo "WARNING: GIT_HELIX_PAT not configured"
@@ -209,6 +248,7 @@ jobs:
           fi
 
           echo "Creating PR in ${{ env.TARGET_REPO }}"
+          echo "Subdomain: $SUBDOMAIN"
           echo "Target folder: $TARGET_FOLDER"
 
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ env.TARGET_REPO }}.git" target-repo
@@ -219,45 +259,29 @@ jobs:
           git config user.name "WSO2-Processor Bot"
           git config user.email "wso2-processor@github.actions"
           git add .
-          git commit -m "feat(${DOMAIN}): UAT request for ${{ inputs.apiName }} v${{ inputs.apiVersion }}"
+          git commit -m "feat(${SUBDOMAIN}): UAT request for ${{ inputs.apiName }} v${{ inputs.apiVersion }}"
           git push origin "${BRANCH_NAME}"
 
+          # Crear PR
           gh pr create \
             --repo "${{ env.TARGET_REPO }}" \
             --base "${{ env.TARGET_BRANCH }}" \
             --head "${BRANCH_NAME}" \
-            --title "UAT [${DOMAIN}]: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" \
-            --body "## UAT Registration Request
-
-| Field | Value |
-|-------|-------|
-| API Name | ${{ inputs.apiName }} |
-| Version | ${{ inputs.apiVersion }} |
-| Domain | ${DOMAIN} |
-| Backend | ${{ steps.export-api.outputs.backend_url }} |
-| Request ID | ${REQUEST_ID} |
-| User | ${{ inputs.userId }} |
-
-### Files Location
-\`${TARGET_FOLDER}/\`
-
-[View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            --title "UAT [${SUBDOMAIN}]: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" \
+            --body "UAT Registration Request for ${{ inputs.apiName }} v${{ inputs.apiVersion }} - Subdomain: ${SUBDOMAIN} - Backend: ${{ steps.export-api.outputs.backend_url }} - Request ID: ${REQUEST_ID} - User: ${{ inputs.userId }} - Files: subdominios/${SUBDOMAIN}/requests/${REQUEST_ID}/"
 
           echo ""
           echo "=========================================="
           echo "  PR Created Successfully!"
-          echo "  Domain: ${DOMAIN}"
+          echo "  Subdomain: ${SUBDOMAIN}"
           echo "  Folder: ${TARGET_FOLDER}"
           echo "=========================================="
 
       - name: Summary
         run: |
           echo "## UAT Request Processed" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Request ID | ${{ steps.request-id.outputs.request_id }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| API | ${{ inputs.apiName }} v${{ inputs.apiVersion }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Domain | ${{ steps.export-api.outputs.domain }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Backend | ${{ steps.export-api.outputs.backend_url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Mock Mode | ${{ steps.wso2-token.outputs.mock }} |" >> $GITHUB_STEP_SUMMARY
+          echo "Request ID: ${{ steps.request-id.outputs.request_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "API: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" >> $GITHUB_STEP_SUMMARY
+          echo "Subdomain: ${{ steps.subdomain.outputs.subdomain }}" >> $GITHUB_STEP_SUMMARY
+          echo "Backend: ${{ steps.export-api.outputs.backend_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "Mock Mode: ${{ steps.wso2-token.outputs.mock }}" >> $GITHUB_STEP_SUMMARY
