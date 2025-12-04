@@ -66,10 +66,10 @@ jobs:
           echo "Configuring apictl environment..."
 
           # Limpiar ambiente anterior si existe
-          ~/.local/bin/apictl/apictl remove env wso2-docker 2>/dev/null || true
+          ~/.local/bin/apictl/apictl/apictl remove env wso2-docker 2>/dev/null || true
 
           # Añadir ambiente
-          ~/.local/bin/apictl/apictl add env wso2-docker \
+          ~/.local/bin/apictl/apictl/apictl add env wso2-docker \
             --apim "https://${{ env.WSO2_HOST }}:${{ env.WSO2_PORT }}"
 
           echo "Environment configured"
@@ -78,7 +78,7 @@ jobs:
         run: |
           echo "Logging into WSO2..."
 
-          ~/.local/bin/apictl/apictl login wso2-docker \
+          ~/.local/bin/apictl/apictl/apictl login wso2-docker \
             -u ${{ env.WSO2_USERNAME }} \
             -p ${{ env.WSO2_PASSWORD }} \
             -k
@@ -94,7 +94,7 @@ jobs:
           mkdir -p "$EXPORT_DIR"
 
           # Exportar API completa (genera ZIP con toda la estructura)
-          ~/.local/bin/apictl/apictl export api \
+          ~/.local/bin/apictl/apictl/apictl export api \
             --name "${{ inputs.apiName }}" \
             --version "${{ inputs.apiVersion }}" \
             --provider admin \
@@ -221,7 +221,7 @@ jobs:
         if: always()
         run: |
           rm -rf ./export-output /tmp/api_export_b64.txt
-          ~/.local/bin/apictl/apictl logout wso2-docker 2>/dev/null || true
+          ~/.local/bin/apictl/apictl/apictl logout wso2-docker 2>/dev/null || true
 
       - name: Summary
         run: |
