@@ -1,6 +1,10 @@
 # =============================================================================
 # WSO2-Processor: Receive UAT Registration Request
 # =============================================================================
+# Organiza las APIs por dominio de backend:
+# - domain-a/ para APIs que apuntan a api.domain-a.com
+# - domain-b/ para APIs que apuntan a api.domain-b.com
+# =============================================================================
 name: Receive UAT Request
 
 on:
@@ -115,47 +119,58 @@ jobs:
             echo "mock=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Export API from WSO2
+      - name: Export API and Determine Domain
         id: export-api
         run: |
           mkdir -p ./export
 
           if [ "${{ steps.wso2-token.outputs.mock }}" == "true" ]; then
             echo "Using mock API data"
-            echo "type: api" > ./export/api.yaml
-            echo "version: v4" >> ./export/api.yaml
-            echo "data:" >> ./export/api.yaml
-            echo "  name: ${{ inputs.apiName }}" >> ./export/api.yaml
-            echo "  version: ${{ inputs.apiVersion }}" >> ./export/api.yaml
-            echo "  context: ${{ inputs.apiContext }}" >> ./export/api.yaml
-            echo "  provider: admin" >> ./export/api.yaml
-            echo "  lifeCycleStatus: PUBLISHED" >> ./export/api.yaml
-
-            echo "openapi: 3.0.0" > ./export/swagger.yaml
-            echo "info:" >> ./export/swagger.yaml
-            echo "  title: ${{ inputs.apiName }}" >> ./export/swagger.yaml
-            echo "  version: ${{ inputs.apiVersion }}" >> ./export/swagger.yaml
+            echo '{"name":"${{ inputs.apiName }}","version":"${{ inputs.apiVersion }}","context":"${{ inputs.apiContext }}","endpointConfig":{"production_endpoints":{"url":"https://api.domain-a.com/mock"}}}' > ./export/api.json
+            echo '{"openapi":"3.0.0","info":{"title":"${{ inputs.apiName }}","version":"${{ inputs.apiVersion }}"}}' > ./export/swagger.json
+            BACKEND_URL="https://api.domain-a.com/mock"
           else
             echo "Exporting from WSO2..."
             curl -sk -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
-              "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}" > ./export/api.yaml
+              "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}" > ./export/api.json
 
             curl -sk -H "Authorization: Bearer ${{ steps.wso2-token.outputs.token }}" \
-              "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}/swagger" > ./export/swagger.yaml
+              "${{ env.WSO2_BASE_URL }}/api/am/publisher/v4/apis/${{ inputs.apiId }}/swagger" > ./export/swagger.json
+
+            BACKEND_URL=$(cat ./export/api.json | jq -r '.endpointConfig.production_endpoints.url // "unknown"')
           fi
+
+          echo "Backend URL: $BACKEND_URL"
+
+          # Determinar dominio basado en el backend URL
+          if echo "$BACKEND_URL" | grep -q "domain-a"; then
+            DOMAIN="domain-a"
+          elif echo "$BACKEND_URL" | grep -q "domain-b"; then
+            DOMAIN="domain-b"
+          else
+            DOMAIN="other"
+          fi
+
+          echo "Detected domain: $DOMAIN"
+          echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+          echo "backend_url=$BACKEND_URL" >> $GITHUB_OUTPUT
 
           echo "Export files:"
           ls -la ./export/
 
       - name: Prepare Request Files
+        id: prepare-files
         run: |
           REQUEST_ID="${{ steps.request-id.outputs.request_id }}"
+          DOMAIN="${{ steps.export-api.outputs.domain }}"
           REQUEST_DIR="./request-${REQUEST_ID}"
           mkdir -p "$REQUEST_DIR"
 
           echo "action: register-uat" > "$REQUEST_DIR/request.yaml"
           echo "request_id: ${REQUEST_ID}" >> "$REQUEST_DIR/request.yaml"
           echo "timestamp: ${{ inputs.timestamp }}" >> "$REQUEST_DIR/request.yaml"
+          echo "domain: ${DOMAIN}" >> "$REQUEST_DIR/request.yaml"
+          echo "backend_url: ${{ steps.export-api.outputs.backend_url }}" >> "$REQUEST_DIR/request.yaml"
           echo "api:" >> "$REQUEST_DIR/request.yaml"
           echo "  id: ${{ inputs.apiId }}" >> "$REQUEST_DIR/request.yaml"
           echo "  name: ${{ inputs.apiName }}" >> "$REQUEST_DIR/request.yaml"
@@ -164,11 +179,13 @@ jobs:
           echo "user: ${{ inputs.userId }}" >> "$REQUEST_DIR/request.yaml"
           echo "run_url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$REQUEST_DIR/request.yaml"
 
-          cp ./export/api.yaml "$REQUEST_DIR/"
-          cp ./export/swagger.yaml "$REQUEST_DIR/"
+          cp ./export/api.json "$REQUEST_DIR/"
+          cp ./export/swagger.json "$REQUEST_DIR/"
 
           echo "Request files:"
           ls -la "$REQUEST_DIR/"
+          echo ""
+          echo "=== request.yaml ==="
           cat "$REQUEST_DIR/request.yaml"
 
       - name: Create PR in GIT-Helix-Processor
@@ -177,49 +194,70 @@ jobs:
         run: |
           REQUEST_ID="${{ steps.request-id.outputs.request_id }}"
           REQUEST_DIR="./request-${REQUEST_ID}"
+          DOMAIN="${{ steps.export-api.outputs.domain }}"
           BRANCH_NAME="request/${REQUEST_ID}"
+
+          # Carpeta destino basada en dominio
+          TARGET_FOLDER="${DOMAIN}/requests/${REQUEST_ID}"
 
           if [ -z "$GH_TOKEN" ]; then
             echo "WARNING: GIT_HELIX_PAT not configured"
             echo "Files prepared but PR not created"
+            echo "Would create in: $TARGET_FOLDER"
             ls -la "$REQUEST_DIR/"
             exit 0
           fi
 
+          echo "Creating PR in ${{ env.TARGET_REPO }}"
+          echo "Target folder: $TARGET_FOLDER"
+
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ env.TARGET_REPO }}.git" target-repo
           cd target-repo
           git checkout -b "${BRANCH_NAME}"
-          mkdir -p "requests/${REQUEST_ID}"
-          cp -r "../${REQUEST_DIR}"/* "requests/${REQUEST_ID}/"
+          mkdir -p "${TARGET_FOLDER}"
+          cp -r "../${REQUEST_DIR}"/* "${TARGET_FOLDER}/"
           git config user.name "WSO2-Processor Bot"
           git config user.email "wso2-processor@github.actions"
           git add .
-          git commit -m "feat: UAT request for ${{ inputs.apiName }} v${{ inputs.apiVersion }}"
+          git commit -m "feat(${DOMAIN}): UAT request for ${{ inputs.apiName }} v${{ inputs.apiVersion }}"
           git push origin "${BRANCH_NAME}"
 
           gh pr create \
             --repo "${{ env.TARGET_REPO }}" \
             --base "${{ env.TARGET_BRANCH }}" \
             --head "${BRANCH_NAME}" \
-            --title "UAT: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" \
+            --title "UAT [${DOMAIN}]: ${{ inputs.apiName }} v${{ inputs.apiVersion }}" \
             --body "## UAT Registration Request
 
-          | Field | Value |
-          |-------|-------|
-          | API Name | ${{ inputs.apiName }} |
-          | Version | ${{ inputs.apiVersion }} |
-          | Request ID | ${REQUEST_ID} |
-          | User | ${{ inputs.userId }} |
+| Field | Value |
+|-------|-------|
+| API Name | ${{ inputs.apiName }} |
+| Version | ${{ inputs.apiVersion }} |
+| Domain | ${DOMAIN} |
+| Backend | ${{ steps.export-api.outputs.backend_url }} |
+| Request ID | ${REQUEST_ID} |
+| User | ${{ inputs.userId }} |
 
-          [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+### Files Location
+\`${TARGET_FOLDER}/\`
 
-          echo "PR created successfully!"
+[View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          echo ""
+          echo "=========================================="
+          echo "  PR Created Successfully!"
+          echo "  Domain: ${DOMAIN}"
+          echo "  Folder: ${TARGET_FOLDER}"
+          echo "=========================================="
 
       - name: Summary
         run: |
           echo "## UAT Request Processed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Request ID | ${{ steps.request-id.outputs.request_id }} |" >> $GITHUB_STEP_SUMMARY
           echo "| API | ${{ inputs.apiName }} v${{ inputs.apiVersion }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Domain | ${{ steps.export-api.outputs.domain }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend | ${{ steps.export-api.outputs.backend_url }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Mock Mode | ${{ steps.wso2-token.outputs.mock }} |" >> $GITHUB_STEP_SUMMARY
