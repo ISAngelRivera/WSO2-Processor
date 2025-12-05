@@ -4,12 +4,20 @@
 # Vendor-específico: Solo extrae datos de WSO2 y los pasa a Helix-Processor
 # Usa apictl export para obtener el backup completo de la API
 # NO contiene lógica de negocio, Helix, ni almacenamiento
+#
+# ESCALABILIDAD: Usa requestId único para correlacionar requests en entornos
+# con 2500+ APIs concurrentes
 # =============================================================================
 name: Receive UAT Request
 
 on:
   workflow_dispatch:
     inputs:
+      requestId:
+        description: 'Unique Request ID for correlation (REQ-xxx-xxx)'
+        required: false
+        type: string
+        default: ''
       apiId:
         description: 'WSO2 API ID'
         required: true
@@ -50,11 +58,28 @@ jobs:
     runs-on: [self-hosted, linux, apiops]
 
     steps:
+      - name: Generate or Use Request ID
+        id: req-id
+        run: |
+          # Use provided requestId or generate one
+          if [ -n "${{ inputs.requestId }}" ]; then
+            REQUEST_ID="${{ inputs.requestId }}"
+          else
+            # Generate fallback ID: REQ-{api-short}-{timestamp}-{random}
+            API_SHORT=$(echo "${{ inputs.apiId }}" | cut -c1-8)
+            TIMESTAMP=$(date +%s | cut -c6-10)
+            RANDOM_PART=$(echo $RANDOM | md5sum | cut -c1-4)
+            REQUEST_ID="REQ-${API_SHORT}-${TIMESTAMP}-${RANDOM_PART}"
+          fi
+          echo "request_id=${REQUEST_ID}" >> $GITHUB_OUTPUT
+          echo "Request ID: ${REQUEST_ID}"
+
       - name: Log Request
         run: |
           echo "=========================================="
           echo "  WSO2 API Extraction Request"
           echo "=========================================="
+          echo "Request ID:  ${{ steps.req-id.outputs.request_id }}"
           echo "API ID:      ${{ inputs.apiId }}"
           echo "API Name:    ${{ inputs.apiName }}"
           echo "API Version: ${{ inputs.apiVersion }}"
@@ -198,9 +223,10 @@ jobs:
           # Leer base64 del archivo
           API_EXPORT_B64=$(cat /tmp/api_export_b64.txt)
 
-          # Llamar al workflow de Helix-Processor
+          # Llamar al workflow de Helix-Processor con requestId
           gh workflow run process-api-request.yml \
             --repo "${{ env.HELIX_PROCESSOR_REPO }}" \
+            -f requestId="${{ steps.req-id.outputs.request_id }}" \
             -f subdominio="${{ steps.export.outputs.subdominio }}" \
             -f apiName="${{ inputs.apiName }}" \
             -f apiVersion="${{ inputs.apiVersion }}" \
@@ -214,6 +240,7 @@ jobs:
           echo ""
           echo "=========================================="
           echo "  Request forwarded to Helix-Processor"
+          echo "  Request ID: ${{ steps.req-id.outputs.request_id }}"
           echo "  Subdominio: ${{ steps.export.outputs.subdominio }}"
           echo "=========================================="
 
@@ -229,6 +256,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Campo | Valor |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Request ID | ${{ steps.req-id.outputs.request_id }} |" >> $GITHUB_STEP_SUMMARY
           echo "| API | ${{ inputs.apiName }} v${{ inputs.apiVersion }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Subdominio | ${{ steps.export.outputs.subdominio }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Backend | ${{ steps.export.outputs.backend_url }} |" >> $GITHUB_STEP_SUMMARY
