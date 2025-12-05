@@ -10,6 +10,9 @@
 # =============================================================================
 name: Receive UAT Request
 
+# Dynamic run name that includes requestId for tracking
+run-name: "UAT: ${{ inputs.apiName }} v${{ inputs.apiVersion }} [${{ inputs.requestId }}]"
+
 on:
   workflow_dispatch:
     inputs:
